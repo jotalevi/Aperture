@@ -1,0 +1,90 @@
+name: bench-automerge
+
+# Use pull_request_target so the workflow runs with repo permissions even
+# from forks — but note we NEVER check out or execute PR code here. We only
+# inspect the file list via the API. That distinction is what keeps it safe.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  verify-and-merge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect changed files
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const pr = context.payload.pull_request;
+
+            // page through all files in the PR
+            const files = await github.paginate(
+              github.rest.pulls.listFiles,
+              {owner, repo, pull_number: pr.number, per_page: 100}
+            );
+
+            if (files.length === 0) {
+              core.setOutput("ok", "false");
+              core.setOutput("reason", "no files in PR");
+              return;
+            }
+
+            const problems = [];
+            for (const f of files) {
+              // every path must live under bench/
+              if (!f.filename.startsWith("bench/")) {
+                problems.push(`path outside bench/: ${f.filename}`);
+              }
+              // additions only — no modify/remove/rename
+              if (f.status !== "added") {
+                problems.push(`disallowed change (${f.status}): ${f.filename}`);
+              }
+              // no nested path traversal or hidden dirs
+              if (f.filename.includes("..") || f.filename.includes("/.")) {
+                problems.push(`suspicious path: ${f.filename}`);
+              }
+              // plain .txt reports only
+              if (!f.filename.endsWith(".txt")) {
+                problems.push(`not a .txt file: ${f.filename}`);
+              }
+            }
+
+            if (problems.length) {
+              core.setOutput("ok", "false");
+              core.setOutput("reason", problems.join("; "));
+            } else {
+              core.setOutput("ok", "true");
+              core.setOutput("reason", `bench-only PR: ${files.length} file(s) added`);
+            }
+
+      - name: Comment result
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const ok = "${{ steps.check.outputs.ok }}" === "true";
+            const reason = "${{ steps.check.outputs.reason }}";
+            const body = ok
+              ? `✅ Auto-merge check passed — ${reason}. Merging.`
+              : `🔍 Auto-merge skipped — ${reason}. A maintainer will review.`;
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.payload.pull_request.number,
+              body
+            });
+
+      - name: Merge if bench-only
+        if: steps.check.outputs.ok == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.pulls.merge({
+              ...context.repo,
+              pull_number: context.payload.pull_request.number,
+              merge_method: "squash"
+            });

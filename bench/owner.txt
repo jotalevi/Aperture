@@ -1,0 +1,68 @@
+============================================================
+APERTURE — TEST & BENCHMARK REPORT
+============================================================
+run id (salted sha256, non-reversible): a17f9d0adee8d7ee8bffbf7d3e9a9f8a04efe2c033ca1ef83b89e57cbfdc39b0
+generated: 2026-06-17T22:05:31
+
+── system ─────────────────────────────────────────────
+  platform           macOS-27.0-arm64-arm-64bit-Mach-O
+  machine            arm64
+  processor          arm
+  python             3.13.2
+  cpu                Apple M4
+  cpu_threads        10
+  ram_gb             16.0
+  torch              2.12.1
+  mps_available      True
+  cuda_available     False
+  net_hf_ms          73.8
+  net_pypi_ms        7.7
+  net_online         True
+
+── unit tests ─────────────────────────────────────────
+  PASS  plain prompt parsed
+  PASS  plain prompt no control
+  PASS  size param
+  PASS  seed param
+  PASS  prompt after params
+  PASS  sketchmode bool true
+  PASS  conf set parsed
+  PASS  conf query parsed
+  PASS  jobs control
+  PASS  reload control
+  PASS  jobs.clear control
+  PASS  params only empty prompt
+  PASS  invalid scheduler raises
+  PASS  sketch caps steps<=12
+  PASS  sketch caps cfg<=3
+  PASS  size width
+  PASS  size height
+  PASS  filename appends png
+  PASS  filename keeps png
+  PASS  bad size raises
+  PASS  load creates config file
+  PASS  config persists set value
+  PASS  unknown config key rejected
+  PASS  token written to file
+  PASS  slice short unchanged
+  PASS  slice long truncated
+
+  total: 26 passed, 0 failed
+
+── benchmarks ─────────────────────────────────────────
+  pipeline load:        40.55s
+  generation runs:      3
+  gen mean:             123.94s
+  gen min / max:        109.62s / 144.46s
+  steps per run:        20
+
+── logs ───────────────────────────────────────────────
+  pipeline loaded in 40.55s
+  gen run 1/3: 109.62s (20 steps)
+  gen run 2/3: 144.46s (20 steps)
+  gen run 3/3: 117.75s (20 steps)
+
+── errors ─────────────────────────────────────────────
+  (none)
+
+============================================================

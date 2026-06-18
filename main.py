@@ -53,7 +53,8 @@ def _ensure_env():
     os.execv(str(vpy), [str(vpy), str(Path(__file__).resolve()), *sys.argv[1:]])
 
 
-_ensure_env()
+if __name__ == "__main__":
+    _ensure_env()
 
 # ─────────────────── heavy imports (only inside the venv) ───────────────────
 import time, re, threading, queue, itertools, gc
