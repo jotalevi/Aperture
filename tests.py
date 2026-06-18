@@ -235,7 +235,7 @@ def anon_run_id():
 def bench_load(cfg, logs):
     import torch
     t = time.time()
-    pipe, bsc, sched = ap.build_pipeline(cfg)
+    pipe, refiner, bsc, sched = ap.build_pipeline(cfg)
     elapsed = time.time() - t
 
     # (3) record actual device — flags silent CPU fallback in the report

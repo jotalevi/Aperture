@@ -61,6 +61,7 @@ import time, re, threading, queue, itertools, gc
 import torch
 from diffusers import (
     StableDiffusionXLPipeline,
+    StableDiffusionXLImg2ImgPipeline,
     AutoencoderKL,
     DPMSolverMultistepScheduler,
     EulerDiscreteScheduler,
@@ -147,6 +148,10 @@ Generation params:
   --filename=NAME   output name (.png optional; _1.._N if q>1)
   --neg="..."       per-shot negative prompt override
   --sketchmode      fast draft: caps steps@12, cfg@3.0 (resets after)
+  --upscale=SPEC    post-resize: x2 (multiplier) or WxH (target size).
+                    WxH preserves aspect (cover + center-crop, no stretch).
+                    add :refine for an img2img detail pass that regenerates
+                    texture — e.g. --upscale=x2:refine, --upscale=1664x2432:refine
 
 Background jobs:
   --jobs            toggle background mode on/off. When ON, prompts are
@@ -266,8 +271,69 @@ def build_pipeline(cfg):
     except Exception as e:
         print(f"  warmup skipped: {e}")
 
+    # img2img pipeline for --upscale refine; shares components (no extra load)
+    refiner = StableDiffusionXLImg2ImgPipeline(**pipe.components)
+
     print(f"ready in {time.time()-t0:.1f}s")
-    return pipe, base_sched_config, cfg["scheduler"]
+    return pipe, refiner, base_sched_config, cfg["scheduler"]
+
+def refine_image(refiner, img, prompt, neg, steps, guidance):
+    """Low-denoise img2img pass to add real detail after upscaling.
+    strength=0.3 keeps composition/identity intact and only sharpens texture."""
+    w, h = img.size
+    g = torch.Generator(device="mps").manual_seed(secrets.randbelow(SEED_MAX + 1))
+    out = refiner(
+        prompt=prompt,
+        negative_prompt=neg,
+        image=img,
+        strength=0.3,            # low: preserves the image, adds detail
+        num_inference_steps=steps,
+        guidance_scale=guidance,
+        generator=g,
+    ).images[0]
+    return out
+
+def parse_upscale(value, src_w, src_h):
+    """Resolve --upscale to (target_w, target_h, mode, refine).
+
+    Append ':refine' to run an img2img detail pass after resizing:
+      --upscale=x2:refine   --upscale=1664x2432:refine
+    """
+    v = str(value).lower().strip()
+    refine = False
+    if v.endswith(":refine"):
+        refine = True
+        v = v[:-len(":refine")]
+
+    m = re.fullmatch(r"(\d+)x(\d+)", v)
+    if m:
+        return int(m.group(1)), int(m.group(2)), "cover", refine
+
+    m = re.fullmatch(r"x?(\d+(?:\.\d+)?)x?", v)
+    if m:
+        factor = float(m.group(1))
+        if factor <= 0:
+            raise ValueError("upscale factor must be positive")
+        return int(round(src_w * factor)), int(round(src_h * factor)), "scale", refine
+
+    raise ValueError(f"bad --upscale='{value}' (use x2, WxH, optional :refine)")
+
+from PIL import Image
+def upscale_image(img, target_w, target_h, mode):
+    """Resize a PIL image. 'scale' = direct resample to target.
+    'cover' = preserve aspect ratio, fill the target, center-crop the
+    overflow (never stretches)."""
+    if mode == "scale":
+        return img.resize((target_w, target_h), Image.LANCZOS)
+
+    # cover: scale so the image fully covers the target, then center-crop
+    src_w, src_h = img.size
+    scale = max(target_w / src_w, target_h / src_h)
+    new_w, new_h = int(round(src_w * scale)), int(round(src_h * scale))
+    resized = img.resize((new_w, new_h), Image.LANCZOS)
+    left = (new_w - target_w) // 2
+    top = (new_h - target_h) // 2
+    return resized.crop((left, top, left + target_w, top + target_h))
 
 def parse_inline(line, defaults):
     """Pull leading --key=value, --conf.*, control tokens, and bare flags.
@@ -412,6 +478,20 @@ def worker_loop(engine, jobq, jobs, lock, sched_state):
                 generator=g,
                 callback_on_step_end=cb,
             ).images[0]
+
+            # upscale / refine (same as foreground path)
+            if spec.get("upscale"):
+                try:
+                    tw, th, mode, refine = parse_upscale(
+                        spec["upscale"], spec["w"], spec["h"])
+                    img = upscale_image(img, tw, th, mode)
+                    if refine:
+                        img = refine_image(
+                            engine["refiner"], img, spec["prompt"], spec["neg"],
+                            spec["steps"], spec["guidance"])
+                except ValueError as e:
+                    print(f"\n  job #{job.id} upscale skipped: {e}")
+
             img.save(spec["outpath"])
             with lock:
                 job.pct = 100
@@ -427,7 +507,7 @@ def worker_loop(engine, jobq, jobs, lock, sched_state):
 def resolve_spec(params, prompt, outdir):
     """Validate params -> generation spec dict. Raises ValueError on bad input."""
     w, h = (int(x) for x in str(params["size"]).lower().split("x"))
-    seed = int(params["seed"])
+    seed = make_seed(params.get("seed"))
     steps = int(params["steps"])
     guidance = float(params["guidance"])
     sketch = bool(params["sketchmode"])
@@ -447,8 +527,19 @@ def resolve_spec(params, prompt, outdir):
         "seed": seed, "steps": steps, "guidance": guidance,
         "scheduler": params["scheduler"].lower(),
         "filename": fname, "outpath": os.path.join(outdir, fname),
+        "upscale": params.get("upscale"),
     }
 
+import secrets
+
+SEED_MAX = 2**32 - 1  # 4294967295
+
+def make_seed(value=None):
+    """Return a usable seed. If value is None/'random'/'rand', generate one;
+    otherwise coerce the provided value into the valid range."""
+    if value is None or str(value).lower() in ("random", "rand", "-1"):
+        return secrets.randbelow(SEED_MAX + 1)
+    return int(value) % (SEED_MAX + 1)
 
 # ─────────────────────────────── main ──────────────────────────────────
 def main():
@@ -460,16 +551,16 @@ def main():
     state = {"outdir": cfg["outdir"]}
     os.makedirs(state["outdir"], exist_ok=True)
 
-    pipe, base_sched_config, current_sched = build_pipeline(cfg)
+    pipe, refiner, base_sched_config, current_sched = build_pipeline(cfg)
     print("type a prompt, --help for manual, Ctrl+C to exit\n")
 
-    defaults = {"size": cfg["default_size"], "seed": cfg["seed"],
+    defaults = {"size": cfg["default_size"], "seed": None,
                 "guidance": cfg["guidance"], "steps": cfg["steps"],
                 "scheduler": cfg["scheduler"], "q": "1", "sketchmode": False,
-                "neg": DEFAULT_NEG, "filename": None}
+                "neg": DEFAULT_NEG, "filename": None, "upscale": None}
 
     # shared live engine (so --reload can swap the pipeline under the closures)
-    engine = {"pipe": pipe, "base_sched_config": base_sched_config}
+    engine = {"pipe": pipe, "refiner": refiner, "base_sched_config": base_sched_config}
     sched_state = {"current": current_sched}
 
     jobs = []
@@ -535,6 +626,19 @@ def main():
                     num_inference_steps=steps, guidance_scale=spec["guidance"],
                     width=spec["w"], height=spec["h"], generator=g,
                     callback_on_step_end=cb).images[0]
+            
+            if spec.get("upscale"):
+                try:
+                    tw, th, mode, refine = parse_upscale(
+                        spec["upscale"], spec["w"], spec["h"])
+                    img = upscale_image(img, tw, th, mode)
+                    if refine:
+                        img = refine_image(
+                            engine["refiner"], img, spec["prompt"], spec["neg"],
+                            spec["steps"], spec["guidance"])
+                except ValueError as e:
+                    print(f"  upscale skipped: {e}")
+            
             img.save(spec["outpath"])
             print(f"\r  saved {spec['outpath']}  ({time.time()-t:.1f}s){' '*12}")
         print()
@@ -582,14 +686,16 @@ def main():
                 torch.mps.empty_cache()
             except Exception:
                 pass
-        new_pipe, new_bsc, new_sched = build_pipeline(cfg)
+
+        new_pipe, new_refiner, new_bsc, new_sched = build_pipeline(cfg)
         engine["pipe"] = new_pipe
+        engine["refiner"] = new_refiner
         engine["base_sched_config"] = new_bsc
         sched_state["current"] = new_sched
         state["outdir"] = cfg["outdir"]
         os.makedirs(state["outdir"], exist_ok=True)
         defaults.update({
-            "size": cfg["default_size"], "seed": cfg["seed"],
+            "size": cfg["default_size"], "seed": None,
             "guidance": cfg["guidance"], "steps": cfg["steps"],
             "scheduler": cfg["scheduler"]})
         print("  reload complete.")
@@ -649,10 +755,11 @@ def main():
             run_foreground(params, prompt)
 
         defaults.update({
-            "size": params["size"], "seed": params["seed"],
+            "size": params["size"], "seed": None,
             "guidance": params["guidance"], "steps": params["steps"],
             "scheduler": params["scheduler"], "q": params["q"],
             "sketchmode": False, "neg": params["neg"], "filename": None,
+            "upscale": None,  # per-shot; don't carry forward by default
         })
 
 
