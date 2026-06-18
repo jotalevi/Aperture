@@ -503,7 +503,6 @@ def worker_loop(engine, jobq, jobs, lock, sched_state):
         finally:
             jobq.task_done()
 
-
 def resolve_spec(params, prompt, outdir):
     """Validate params -> generation spec dict. Raises ValueError on bad input."""
     w, h = (int(x) for x in str(params["size"]).lower().split("x"))
