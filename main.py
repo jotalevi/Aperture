@@ -61,6 +61,7 @@ import time, re, threading, queue, itertools, gc
 import torch
 from diffusers import (
     StableDiffusionXLPipeline,
+    AutoencoderKL,
     DPMSolverMultistepScheduler,
     EulerDiscreteScheduler,
     EulerAncestralDiscreteScheduler,
@@ -187,6 +188,30 @@ def make_scheduler(name, base_config):
     cls, kw = SCHEDULERS[name]
     return cls.from_config(base_config, **kw)
 
+# pixel budget above which attention slicing is worth it on a 16GB machine.
+# 832x1216 ≈ 1.01M px sits just under; 1024x1024 ≈ 1.05M just over.
+SLICE_PIXEL_THRESHOLD = 1_040_000
+def _apply_slicing(pipe, size_str, q):
+    """Enable/disable slicing based on render size and batch count.
+
+    - attention slicing: only above the pixel threshold (large renders)
+    - vae slicing: only for batches (q>1); pointless overhead for single images
+    """
+    try:
+        w, h = (int(x) for x in str(size_str).lower().split("x"))
+        px = w * h
+    except ValueError:
+        px = SLICE_PIXEL_THRESHOLD + 1  # unknown -> be safe, slice
+
+    if px > SLICE_PIXEL_THRESHOLD:
+        pipe.enable_attention_slicing()
+    else:
+        pipe.disable_attention_slicing()
+
+    if q > 1:
+        pipe.enable_vae_slicing()
+    else:
+        pipe.disable_vae_slicing()
 
 def build_pipeline(cfg):
     """Construct pipeline + scheduler from current config."""
@@ -199,14 +224,50 @@ def build_pipeline(cfg):
     else:
         pipe = StableDiffusionXLPipeline.from_pretrained(
             checkpoint, torch_dtype=torch.float16, use_safetensors=True)
+        
+    # (1) fp16-fix VAE: stays in fp16 (faster decode than fp32) while avoiding
+    # the overflow that produces black images on MPS.
+    try:
+        fixed_vae = AutoencoderKL.from_pretrained(
+            "madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
+        pipe.vae = fixed_vae
+        print("  using sdxl-vae-fp16-fix")
+    except Exception as e:
+        # fall back to the safe fp32 path if the download isn't available
+        pipe.vae = pipe.vae.to(torch.float32)
+        print(f"  fp16-fix VAE unavailable ({e}); using fp32 VAE fallback")
+
     pipe = pipe.to("mps")
-    pipe.enable_attention_slicing()
-    pipe.enable_vae_slicing()
+
+    # (5)(6) slicing trades speed for lower peak memory — only enable it when
+    # the workload actually needs it. Decide from the default render size;
+    # per-shot overrides are handled in apply_slicing() below.
+    _apply_slicing(pipe, cfg["default_size"], q=1)
+
     base_sched_config = pipe.scheduler.config
     pipe.scheduler = make_scheduler(cfg["scheduler"], base_sched_config)
+
+    # (3) verify we're actually on the GPU — a silent CPU fallback is ~10x slower
+    dev = str(pipe.unet.device)
+    if "mps" not in dev:
+        print(f"  WARNING: pipeline is on '{dev}', not mps — generation will be "
+              f"very slow. Check torch MPS availability.")
+    else:
+        print(f"  device: {dev}")
+
+    # (4) warmup: first generation compiles Metal kernels lazily; do a tiny
+    # throwaway run now so the user's first real image isn't penalized.
+    try:
+        t_w = time.time()
+        _ = pipe(prompt="warmup", num_inference_steps=1,
+                 width=256, height=256,
+                 generator=torch.Generator(device="mps").manual_seed(0)).images[0]
+        print(f"  warmup done in {time.time()-t_w:.1f}s")
+    except Exception as e:
+        print(f"  warmup skipped: {e}")
+
     print(f"ready in {time.time()-t0:.1f}s")
     return pipe, base_sched_config, cfg["scheduler"]
-
 
 def parse_inline(line, defaults):
     """Pull leading --key=value, --conf.*, control tokens, and bare flags.
@@ -332,6 +393,8 @@ def worker_loop(engine, jobq, jobs, lock, sched_state):
                                                 base_sched_config)
                 sched_state["current"] = spec["scheduler"]
 
+            _apply_slicing(pipe, f"{spec['w']}x{spec['h']}", 1)  # (5)(6)
+
             steps = spec["steps"]
 
             def cb(pipe, step, ts, kw):
@@ -440,6 +503,8 @@ def main():
         if spec0["scheduler"] != sched_state["current"]:
             p.scheduler = make_scheduler(spec0["scheduler"], bsc)
             sched_state["current"] = spec0["scheduler"]
+        
+        _apply_slicing(p, f"{spec0['w']}x{spec0['h']}", q)   # (5)(6)
 
         print(f"  prompt: {slice_prompt(prompt, 60)}")
         print(f"  {spec0['w']}x{spec0['h']}  seed={spec0['seed']}  "

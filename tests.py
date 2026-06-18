@@ -233,11 +233,19 @@ def anon_run_id():
 
 # ───────────────────────────── benchmarks ─────────────────────────────
 def bench_load(cfg, logs):
-    import torch  # noqa
+    import torch
     t = time.time()
     pipe, bsc, sched = ap.build_pipeline(cfg)
     elapsed = time.time() - t
-    return pipe, bsc, sched, elapsed
+
+    # (3) record actual device — flags silent CPU fallback in the report
+    dev = str(pipe.unet.device)
+    logs.append(f"  device: {dev}")
+    on_mps = "mps" in dev
+    if not on_mps:
+        logs.append("  WARNING: not running on mps — timings reflect CPU fallback")
+
+    return pipe, bsc, sched, elapsed, on_mps
 
 
 def bench_generate(pipe, sched, runs, logs):
@@ -298,6 +306,8 @@ def write_report(path, run_id, ts_human, sysinfo, unit, bench, logs, errors):
     else:
         if "load_s" in bench:
             L.append(f"  pipeline load:        {bench['load_s']:.2f}s")
+        if "on_mps" in bench:
+            L.append(f"  device:               {'mps' if bench['on_mps'] else 'CPU (fallback!)'}")
         if bench.get("gen_timings"):
             g = bench["gen_timings"]
             L.append(f"  generation runs:      {len(g)}")
@@ -364,9 +374,11 @@ def main():
             if cfg.get("hf_token"):
                 os.environ["HF_TOKEN"] = cfg["hf_token"]
                 os.environ["HUGGING_FACE_HUB_TOKEN"] = cfg["hf_token"]
-            pipe, bsc, sched, load_s = bench_load(cfg, logs)
+            pipe, bsc, sched, load_s, on_mps = bench_load(cfg, logs)
             bench["load_s"] = load_s
+            bench["on_mps"] = on_mps
             logs.append(f"  pipeline loaded in {load_s:.2f}s")
+
             try:
                 timings = bench_generate(pipe, sched, a.runs, logs)
                 bench["gen_timings"] = timings
