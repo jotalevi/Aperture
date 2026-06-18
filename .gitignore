@@ -1,0 +1,14 @@
+# generated images
+/output/
+*.png
+
+# virtual environment
+.venv/
+
+# local config (contains HF token — never commit)
+/configs/
+
+# python noise
+__pycache__/
+*.pyc
+.DS_Store
