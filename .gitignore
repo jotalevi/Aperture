@@ -1,5 +1,6 @@
 # generated images
 /output/
+/output
 *.png
 
 # virtual environment
