@@ -156,6 +156,7 @@ Help build a cross-device performance picture by contributing your report. It's 
    python tests.py
 ```
    With no `--out`, the report is written to `bench/<run_id>.txt` automatically — the run id is the non-reversible hash, so the filename is already unique and collision-safe. Don't rename it.
+   
 3. **Commit only that one file** under `bench/`:
 ```bash
    git add bench/<run_id>.txt
@@ -163,6 +164,7 @@ Help build a cross-device performance picture by contributing your report. It's 
    git push
 ```
    (tip: `git add bench/` picks up the new report without you typing the long hash)
+   
 4. **Open a pull request.** PRs that *only add* a single file under `bench/` are **merged automatically** by CI — no review wait. Anything touching code, or modifying/deleting existing files, goes to normal review.
 
 ### What auto-merges
